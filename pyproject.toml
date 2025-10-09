@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "surrogatetools"
+version = "2025.0.0"
+authors = [
+  { name="Samuel Engel", email="samuel.engel@manchester.ac.uk"},
+]
+description = "Surrogate modelling tools for Python"
+readme = "README.md"
+requires-python = ">=3.11"
+
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "scipy",
+    "arviz",
+    "numpy",
+    "scikit-learn",
+    "pymc",
+    "matplotlib",
+    "pytensor",
+    "nutpie",
+    "numpyro",
+    "numba",
+]
+
+[project.urls]
+Homepage = "https://github.com/LightForm-group/surrogatetools"
+Issues = "https://github.com/LightForm-group/surrogatetools/issues"
