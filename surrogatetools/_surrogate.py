@@ -7,7 +7,6 @@ import scipy
 
 import pymc as pm
 import pytensor
-pytensor.config.cxx = "/usr/bin/clang++" # Requirement for Apple Silicon
 import pytensor.tensor as pt
 from pytensor.graph import Apply, Op
 import numpy as np
@@ -15,11 +14,14 @@ import numpy as np
 class Surrogate:
     def __init__(self,X, y, parameter_names=None):
 
-        self.X_scaler = None
-        self.y_scaler = None
-
         self.X = X
         self.y = y
+
+        self.X_mean = None
+        self.y_mean = None
+
+        self.X_std = None
+        self.y_std = None
 
         self.parameter_range = np.array([np.min(self.X,axis=0),
                                         np.max(self.X,axis=0)]).T
@@ -29,19 +31,25 @@ class Surrogate:
         self.N, self.D = self.X.shape
         self.N, self.P = self.y.shape
         
-    def scale_data(self, scale_X=True,scale_y=True):
+    def scale_data(self, scale_X=True,scale_y=True, X_mean=None, y_mean=None, X_std=None,y_std=None):
 
-        if self.X_scaler == None:
-            self.X_scaler = RobustScaler().fit(self.X)
+        if (X_mean == None) and (scale_X == True):
+            self.X_mean = self.X.mean(axis=0)
+            self.X_std = self.X.std(axis=0) if X_std is None else X_std
 
-        if self.y_scaler == None:
-            self.y_scaler = RobustScaler().fit(self.y)
+        if (y_mean == None) and (scale_y == True):
+            self.y_mean = self.y.mean(axis=0)
+            self.y_std = self.y.std(axis=0) if y_std is None else y_std
 
         if scale_X==True:
-            self.X = self.X_scaler.transform(self.X)
+            self.X = (self.X - self.X_mean)/self.X_std
 
         if scale_y==True:
-            self.y = self.y_scaler.transform(self.y)
+            self.y = (self.y - self.y_mean)/self.y_std
+        
+        # update parameter space if scaling has been done
+        self.parameter_range = np.array([np.min(self.X,axis=0),
+                                        np.max(self.X,axis=0)]).T
             
         return None
     
@@ -77,17 +85,17 @@ class Surrogate:
 
     def make_prediction(self,X,return_std=False,scalar_output=False):
         
-        if self.X_scaler is not None:
-            X = self.X_scaler.transform(X)
+        if self.X_mean is not None:
+            X = (X - self.X_mean)/self.X_std
 
         y_prediction, y_error = self.model.predict(X,return_std=True)
 
         if scalar_output == True:
             y_prediction = y_prediction.reshape(1, -1)
 
-        if self.y_scaler is not None:
-            y_prediction = self.y_scaler.inverse_transform(y_prediction)
-            y_error = y_error*self.y_scaler.scale_
+        if self.y_mean is not None:
+            y_prediction = y_prediction*self.y_std + self.y_mean
+            y_error = y_error*self.y_std
 
         if return_std:
             return y_prediction, y_error
@@ -127,7 +135,7 @@ class Surrogate:
         
         return sobol
     
-    def fit(self,Y_actual,Y_error,use_std=True,**kwargs):
+    def fit(self,Y_actual,Y_error,use_std=True,error_scale=1.0,loss_func=None,**kwargs):
 
         def _loss(params,Y_actual,Y_error):
 
@@ -137,7 +145,7 @@ class Surrogate:
 
                 y_prediction,y_prediction_error = self.make_prediction(X=params,return_std=True)
 
-                residual_square = (y_prediction[0] - Y_actual)**2 + y_prediction_error**2
+                residual_square = (y_prediction[0] - Y_actual)**2 + error_scale*y_prediction_error**2
 
             else:
                 y_prediction = self.make_prediction(X=params)
@@ -149,15 +157,17 @@ class Surrogate:
             loss = residual_square / error_residual_square
                                 
             return loss.sum()
+        
+        loss = loss_func if loss_func is not None else _loss
 
-        res = scipy.optimize.shgo(_loss,
+        res = scipy.optimize.shgo(loss,
                                 bounds=self.parameter_range,
                                 args=(Y_actual, Y_error),
                                 **kwargs)
 
         return res
 
-    def perfom_inference(self,Y_actual,Y_error,initval=None,use_std=True,**kwargs):
+    def perfom_inference(self,Y_actual,Y_error,initval=None,use_std=True,error_scale=1.0,**kwargs):
 
         data = [Y_actual,Y_error]
 
@@ -172,7 +182,7 @@ class Surrogate:
             if use_std==True:
                 y_prediction, y_prediction_error = self.make_prediction(params, return_std=True)
 
-                residual_square = (y_prediction[0] - y_actual)**2 + y_prediction_error[0]**2
+                residual_square = (y_prediction[0] - y_actual)**2 + error_scale*y_prediction_error[0]**2
             
             else:
                 y_prediction = self.make_prediction(params)
@@ -232,7 +242,7 @@ class Surrogate:
                 distribution = pm.Uniform(self.parameter_names[i], 
                                         lower=self.parameter_range[i][0], 
                                         upper=self.parameter_range[i][1],
-                                        initval=initval[i])
+                                        initval=initval[i] if initval is not None else None)
                 
                 params.append(distribution)
 
