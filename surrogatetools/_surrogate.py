@@ -47,9 +47,6 @@ class Surrogate:
         if scale_y==True:
             self.y = (self.y - self.y_mean)/self.y_std
         
-        # update parameter space if scaling has been done
-        self.parameter_range = np.array([np.min(self.X,axis=0),
-                                        np.max(self.X,axis=0)]).T
             
         return None
     
