@@ -164,7 +164,7 @@ class Surrogate:
 
         return res
 
-    def perfom_inference(self,Y_actual,Y_error,initval=None,use_std=True,error_scale=1.0,**kwargs):
+    def perfom_inference(self,Y_actual,Y_error,initval=None,use_std=True,error_scale=1.0,loss_func=None,**kwargs):
 
         data = [Y_actual,Y_error]
 
@@ -175,20 +175,22 @@ class Surrogate:
             
             y_actual, y_actual_error = data
 
-            # The surrogate must provide a prediction and uncertainty estimate
-            if use_std==True:
+            if loss_func is None:
+                # The surrogate must provide a prediction and uncertainty estimate
                 y_prediction, y_prediction_error = self.make_prediction(params, return_std=True)
 
-                residual_square = (y_prediction[0] - y_actual)**2 + error_scale*y_prediction_error[0]**2
-            
-            else:
-                y_prediction = self.make_prediction(params)
+                if use_std == True:
+                    residual_square = (y_prediction[0] - y_actual)**2 + error_scale*y_prediction_error[0]**2
 
-                residual_square = (y_prediction[0] - y_actual)**2
+                else:
+                    residual_square = (y_prediction[0] - y_actual)**2
 
-            loss = residual_square / y_actual_error**2
+                loss = residual_square / y_actual_error**2
 
-            f = - 0.5 * loss
+            else: 
+                loss = loss_func(params,Y_actual,Y_error)
+
+            f = -1 * loss
             
             return f 
 
