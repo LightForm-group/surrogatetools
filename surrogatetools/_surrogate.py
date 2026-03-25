@@ -1,9 +1,10 @@
-from sklearn.preprocessing import RobustScaler
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern
 from sklearn.model_selection import cross_val_score
+from sklearn.preprocessing import StandardScaler
 from scipy.stats import norm, uniform
 import scipy
+from collections.abc import Callable
 
 import pymc as pm
 import pytensor
@@ -12,55 +13,76 @@ from pytensor.graph import Apply, Op
 import numpy as np
 
 class Surrogate:
-    def __init__(self,X, y, parameter_names=None):
+    def __init__(self,
+                 X : np.ndarray, 
+                 y : np.ndarray,
+                 parameter_names : list[str] | None = None):
+        """
+        Surrogate initialisation parameters
+
+        Parameters
+        ----------
+        X : np.ndarray
+            X data of dimensionality NxD
+        y : np.ndarray
+            Y data of dimensionality NxP
+        parameter_names : list[str] | None, optional
+            Name of each input dimension of X, by default None which automatically 
+            generates alphabetical names
+        """
 
         self.X = X
         self.y = y
 
-        self.X_mean = None
-        self.y_mean = None
-
-        self.X_std = None
-        self.y_std = None
+        self.X_scaler = None
+        self.y_scaler = None
 
         self.parameter_range = np.array([np.min(self.X,axis=0),
                                         np.max(self.X,axis=0)]).T
 
-        self.parameter_names = parameter_names
-
         self.N, self.D = self.X.shape
         self.N, self.P = self.y.shape
+
+        # automatically generate parameter names if they are not provided
+        self.parameter_names = parameter_names if parameter_names is not None else  [chr(i) for i in range(self.D)]
+
+
+    def scale_data(self, X_scaler = StandardScaler(), y_scaler = StandardScaler()):
+        """
+        Scale input and output parameters, using Sci-kit scalers by default. Custom
+        scalers can be used but must have fit(), transform() and inverse_transform() 
+        functionality. The scalers must also have a scale_ property to allow for 
+        uncertainty in predictions to be transformed. 
+
+        Parameters
+        ----------
+        X_scaler : Callable, optional
+            Scaler function to use, by default sklearn.preprocessing.StandardScaler()
+        y_scaler : Callable, optional
+            Scaler function to use, by default sklearn.preprocessing.StandardScaler()
+        """
+
+        self.X_scaler = X_scaler
+        self.y_scaler = y_scaler
+
+        self.X_scaler.fit(self.X)
+        self.y_scaler.fit(self.y)
+
+        self.X = X_scaler.transform(self.X)
+        self.y = y_scaler.transform(self.y)
         
-    def scale_data(self, scale_X=True,scale_y=True, X_mean=None, y_mean=None, X_std=None,y_std=None):
-
-        if (X_mean == None) and (scale_X == True):
-            self.X_mean = self.X.mean(axis=0)
-            self.X_std = self.X.std(axis=0) if X_std is None else X_std
-
-        if (y_mean == None) and (scale_y == True):
-            self.y_mean = self.y.mean(axis=0)
-            self.y_std = self.y.std(axis=0) if y_std is None else y_std
-
-        if scale_X==True:
-            self.X = (self.X - self.X_mean)/self.X_std
-
-        if scale_y==True:
-            self.y = (self.y - self.y_mean)/self.y_std
-        
-            
         return None
     
     def build_model(self,
-                    kernel='matern',
-                    cross_validate=False,
-                    cross_validator=5,
-                    scoring='neg_mean_absolute_error',
+                    kernel = 'matern',
+                    cross_validate : bool = False,
+                    cross_validator : int = 5,
+                    scoring : str ='neg_mean_absolute_error',
                     **kwargs):
 
         # Firstly we define the kernel to be used
         if kernel=='matern':
-            kernel = 1.0 * Matern(length_scale=self.D*[1],nu=2.5) + 1.0
-
+            kernel = 1.0 * Matern(length_scale=self.D*[1],nu=2.5) 
         else:
             kernel = kernel
         
@@ -80,34 +102,34 @@ class Surrogate:
 
         return None
 
-    def make_prediction(self,X,return_std=False,scalar_output=False):
+    def make_prediction(self,X : np.ndarray,
+                        ):
         
-        if self.X_mean is not None:
-            X = (X - self.X_mean)/self.X_std
+        if self.X_scaler is not None:
+            X = self.X_scaler.transform(X)
 
-        y_prediction, y_error = self.model.predict(X,return_std=True)
+        y_prediction, y_prediction_error = self.model.predict(X,return_std=True)
 
-        if scalar_output == True:
-            y_prediction = y_prediction.reshape(1, -1)
+        if self.y_scaler is not None:
+            y_prediction = self.y_scaler.inverse_transform(y_prediction)
+            y_prediction_error = self.y_scaler.scale_*y_prediction_error
 
-        if self.y_mean is not None:
-            y_prediction = y_prediction*self.y_std + self.y_mean
-            y_error = y_error*self.y_std
-
-        if return_std:
-            return y_prediction, y_error
-        else:
-            return y_prediction
+        return y_prediction,  y_prediction_error
         
-    def make_prediction_sobol(self,X):
+    def make_prediction_sobol(self,
+                              X : np.ndarray
+                              ):
         
         X = np.array(X).T
 
-        y_prediction = self.make_prediction(X,return_std=False)
+        y_prediction, _ = self.make_prediction(X)
 
         return y_prediction.T
 
-    def generate_sobol(self,use_fit=False,**kwargs):
+    def generate_sobol(self,
+                       use_fit : bool = False,
+                       **kwargs
+                       ):
         """
         Wrapper function for scipy.stats.sobol_indices
 
@@ -132,60 +154,46 @@ class Surrogate:
         
         return sobol
     
-    def fit(self,Y_actual,Y_error,use_std=True,error_scale=1.0,loss_func=None,**kwargs):
+    def fit(self,
+            Y_actual : np.ndarray,
+            Y_error : np.ndarray,
+            error_scale : float = 0.0,
+            loss_func: Callable | None = None,
+            **kwargs):
 
         def _loss(params,Y_actual,Y_error):
 
             params = np.array(params).reshape(1, -1)
 
-            if use_std==True:
+            y_prediction,y_prediction_error = self.make_prediction(X=params)
 
-                y_prediction,y_prediction_error = self.make_prediction(X=params,return_std=True)
-
-                residual_square = (y_prediction[0] - Y_actual)**2 + error_scale*y_prediction_error**2
-
-            else:
-                y_prediction = self.make_prediction(X=params)
-
-                residual_square = (y_prediction[0] - Y_actual)**2
-
-            error_residual_square = Y_error**2
-
-            loss = residual_square / error_residual_square
+            loss = (y_prediction - Y_actual)**2/Y_error**2 + error_scale*y_prediction_error**2/Y_error**2
                                 
             return loss.sum()
         
         loss = loss_func if loss_func is not None else _loss
 
-        res = scipy.optimize.shgo(loss,
-                                bounds=self.parameter_range,
-                                args=(Y_actual, Y_error),
-                                **kwargs)
-
+        res = scipy.optimize.shgo(  loss,
+                                    bounds=self.parameter_range,
+                                    args=(Y_actual, Y_error),
+                                    **kwargs
+                                    )
         return res
 
-    def perfom_inference(self,Y_actual,Y_error,initval=None,use_std=True,error_scale=1.0,loss_func=None,**kwargs):
+    def perfom_inference(self,Y_actual,Y_error,initval=None,error_scale=0.0,loss_func=None,import_prior=None,**kwargs):
 
         data = [Y_actual,Y_error]
 
         def my_loglike(params,data):
-            # We fail explicitly if inputs are not numerical types for the sake of this tutorial
-            # As defined, my_loglike would actually work fine with PyTensor variables!
             params = np.array(params).reshape(1, -1)
             
-            y_actual, y_actual_error = data
+            y_actual, y_error = data
 
             if loss_func is None:
                 # The surrogate must provide a prediction and uncertainty estimate
-                y_prediction, y_prediction_error = self.make_prediction(params, return_std=True)
+                y_prediction, y_prediction_error = self.make_prediction(params)
 
-                if use_std == True:
-                    residual_square = (y_prediction[0] - y_actual)**2 + error_scale*y_prediction_error[0]**2
-
-                else:
-                    residual_square = (y_prediction[0] - y_actual)**2
-
-                loss = residual_square / y_actual_error**2
+                loss = (y_prediction - y_actual)**2/y_error**2 + error_scale*y_prediction_error**2/y_error**2
 
             else: 
                 loss = loss_func(params,Y_actual,Y_error)
@@ -202,8 +210,6 @@ class Surrogate:
 
                 inputs = [params, data]
                 # Define output type, in our case a vector of likelihoods
-                # with the same dimensions and same data type as data
-                # If data must always be a vector, we could have hard-coded
                 outputs = [pt.vector()]
 
                 # Apply is an object that combines inputs, outputs and an Op (self)
@@ -218,7 +224,6 @@ class Surrogate:
                 loglike_eval = my_loglike(params, data)
 
                 # Save the result in the outputs list provided by PyTensor
-                # There is one list per output, each containing another list
                 # pre-populated with a `None` where the result should be saved.
                 outputs[0][0] = np.asarray(loglike_eval)
 
@@ -228,7 +233,6 @@ class Surrogate:
         def custom_dist_loglike(data, params):
 
             # create our Op
-            # data, or observed is always passed as the first input of CustomDist
             return loglike_op(params, data)
 
         # use PyMC to sampler from log-likelihood
@@ -236,14 +240,27 @@ class Surrogate:
 
             params = []
 
-            for i in range(self.D):
-                
-                distribution = pm.Uniform(self.parameter_names[i], 
-                                        lower=self.parameter_range[i][0], 
-                                        upper=self.parameter_range[i][1],
-                                        initval=initval[i] if initval is not None else None)
-                
-                params.append(distribution)
+            if import_prior is not None:
+                for i in range(self.D):
+ 
+                    samples = import_prior[:,i]
+
+                    smin,smax = self.parameter_range[i]
+
+                    x = np.linspace(smin, smax, 100)
+                    y = scipy.stats.gaussian_kde(samples)(x)
+
+                    params.append(pm.Interpolated(self.parameter_names[i], x, y))
+            else:
+
+                for i in range(self.D):
+                    
+                    distribution = pm.Uniform(self.parameter_names[i], 
+                                            lower=self.parameter_range[i][0], 
+                                            upper=self.parameter_range[i][1],
+                                            initval=initval[i] if initval is not None else None)
+                    
+                    params.append(distribution)
 
             # use a CustomDist with a custom logp function
             likelihood = pm.CustomDist(
