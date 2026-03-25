@@ -16,35 +16,47 @@ class Surrogate:
     def __init__(self,
                  X : np.ndarray, 
                  y : np.ndarray,
-                 parameter_names : list[str] | None = None):
+                 D : np.ndarray | None = None,
+                 X_labels : list[str] | None = None):
         """
         Surrogate initialisation parameters
 
         Parameters
         ----------
         X : np.ndarray
-            X data of dimensionality NxD
+            X data of dimensionality NxM
         y : np.ndarray
             Y data of dimensionality NxP
-        parameter_names : list[str] | None, optional
+        D : np.ndarray | None, optional
+            Design data of dimensionality NxQ
+        X_labels : list[str] | None, optional
             Name of each input dimension of X, by default None which automatically 
             generates alphabetical names
         """
 
         self.X = X
         self.y = y
+        self.D = D
+
+        # Create Z the combined surrogate input
+        # After creating Z, X will not be explicitly used again
+        self.Z = np.hstack([self.X,self.D]) if self.D is not None else self.X
 
         self.X_scaler = None
         self.y_scaler = None
 
-        self.parameter_range = np.array([np.min(self.X,axis=0),
-                                        np.max(self.X,axis=0)]).T
+        self.X_range = np.array([np.min(self.X,axis=0),
+                                 np.max(self.X,axis=0)]).T
 
-        self.N, self.D = self.X.shape
-        self.N, self.P = self.y.shape
+        self.Z_range = np.array([np.min(self.Z,axis=0),
+                                 np.max(self.Z,axis=0)]).T
+
+        self.N1, self.M = self.X.shape
+        self.N2, self.P = self.y.shape
+        self.N3, self.Q = self.Z.shape
 
         # automatically generate parameter names if they are not provided
-        self.parameter_names = parameter_names if parameter_names is not None else  [chr(i) for i in range(self.D)]
+        self.X_labels = X_labels if X_labels is not None else  [chr(i) for i in range(self.M)]
 
 
     def scale_data(self, X_scaler = StandardScaler(), y_scaler = StandardScaler()):
@@ -65,10 +77,10 @@ class Surrogate:
         self.X_scaler = X_scaler
         self.y_scaler = y_scaler
 
-        self.X_scaler.fit(self.X)
+        self.X_scaler.fit(self.Z)
         self.y_scaler.fit(self.y)
 
-        self.X = X_scaler.transform(self.X)
+        self.Z = X_scaler.transform(self.Z)
         self.y = y_scaler.transform(self.y)
         
         return None
@@ -82,7 +94,7 @@ class Surrogate:
 
         # Firstly we define the kernel to be used
         if kernel=='matern':
-            kernel = 1.0 * Matern(length_scale=self.D*[1],nu=2.5) 
+            kernel = 1.0 * Matern(length_scale=self.Q*[1],nu=2.5) 
         else:
             kernel = kernel
         
@@ -92,23 +104,58 @@ class Surrogate:
         if cross_validate==True:
 
             model = GaussianProcessRegressor(kernel=kernel,**kwargs)
-            score = cross_val_score(model, self.X, self.y, cv=cross_validator,scoring=scoring)
+            score = cross_val_score(model, self.Z, self.y, cv=cross_validator,scoring=scoring)
                 
             print('Cross validation score: ', np.round(score,2))
 
         self.model = GaussianProcessRegressor(kernel=kernel,**kwargs)
 
-        self.model.fit(self.X, self.y)
+        self.model.fit(self.Z, self.y)
 
         return None
 
-    def make_prediction(self,X : np.ndarray,
+    def make_prediction(self, 
+                        X : np.ndarray,
+                        D : np.ndarray | None = None,
                         ):
         
-        if self.X_scaler is not None:
-            X = self.X_scaler.transform(X)
+        # Here, X may be a single vector of variables and D a list of designs
+        # Alternatively, X may be a matrix and D a single design
+        # However, this functionality may be overwritten by specifying Z as X
+        # including any design variables, however caution is advised as the inputs
+        # may lose interpretability. 
 
-        y_prediction, y_prediction_error = self.model.predict(X,return_std=True)
+        if D is not None:
+            # Firstly consider single X and one or more designs
+            if (X.shape[0] == 1) and (D.shape[0] > 1):
+                
+                X_stack = X.repeat(D.shape[0],axis=0)
+
+                Z = np.hstack([X_stack,D])
+            
+            # Now, consider the reverse
+            elif (X.shape[0] > 1) and (D.shape[0] == 1):
+
+                D_stack = D.repeat(X.shape[0],axis=0)
+                
+                Z = np.hstack([X,D_stack])
+            
+            # Now consider we have specified a design for each input
+            elif (X.shape[0] == D.shape[0]):
+
+                Z = np.hstack([X,D])
+
+            else:
+                raise AssertionError("Input shapes of X and D are not compatible. Ensure both are 2D arrays.")
+
+        # Trivially if D is not implemented then simply use X
+        else: 
+            Z = X
+
+        if self.X_scaler is not None:
+            Z = self.X_scaler.transform(Z)
+                
+        y_prediction, y_prediction_error = self.model.predict(Z,return_std=True)
 
         if self.y_scaler is not None:
             y_prediction = self.y_scaler.inverse_transform(y_prediction)
@@ -143,10 +190,10 @@ class Surrogate:
         """
 
         if use_fit==True:
-            distributions = [norm(loc=self.parameter_mean[i], scale=self.parameter_std[i]) for i in range(len(self.parameter_range))]
+            distributions = [norm(loc=self.parameter_mean[i], scale=self.parameter_std[i]) for i in range(len(self.Z_range))]
 
         else:
-            distributions = [uniform(loc=x[0], scale = x[1]-x[0]) for x in self.parameter_range]
+            distributions = [uniform(loc=x[0], scale = x[1]-x[0]) for x in self.Z_range]
 
         sobol = scipy.stats.sobol_indices(func=self.make_prediction_sobol,
                                           dists=distributions,
@@ -157,58 +204,63 @@ class Surrogate:
     def fit(self,
             Y_actual : np.ndarray,
             Y_error : np.ndarray,
+            D : np.ndarray | None = None,
             error_scale : float = 0.0,
             loss_func: Callable | None = None,
             **kwargs):
 
-        def _loss(params,Y_actual,Y_error):
+        def _loss(X,D,Y_actual,Y_error):
 
-            params = np.array(params).reshape(1, -1)
+            X = np.array(X).reshape(1, -1)
 
-            y_prediction,y_prediction_error = self.make_prediction(X=params)
+            y_prediction,y_prediction_error = self.make_prediction(X=X,D=D)
 
             loss = (y_prediction - Y_actual)**2/Y_error**2 + error_scale*y_prediction_error**2/Y_error**2
                                 
-            return loss.sum()
+            return loss.mean()
         
         loss = loss_func if loss_func is not None else _loss
 
         res = scipy.optimize.shgo(  loss,
-                                    bounds=self.parameter_range,
-                                    args=(Y_actual, Y_error),
+                                    bounds=self.X_range,
+                                    args=(D, Y_actual, Y_error),
                                     **kwargs
                                     )
         return res
 
-    def perfom_inference(self,Y_actual,Y_error,initval=None,error_scale=0.0,loss_func=None,import_prior=None,**kwargs):
+    def perfom_inference(self,D,Y_actual,Y_error,initval=None,error_scale=0.0,loss_func=None,import_prior=None,**kwargs):
 
-        data = [Y_actual,Y_error]
+        Y_data = [Y_actual,Y_error]
 
-        def my_loglike(params,data):
-            params = np.array(params).reshape(1, -1)
+        def my_loglike(X, D, Y_data):
+
+            X = np.array(X).reshape(1, -1)
             
-            y_actual, y_error = data
+            y_actual, y_error = Y_data
 
             if loss_func is None:
                 # The surrogate must provide a prediction and uncertainty estimate
-                y_prediction, y_prediction_error = self.make_prediction(params)
+                y_prediction, y_prediction_error = self.make_prediction(X,D.reshape(-1,1))
 
                 loss = (y_prediction - y_actual)**2/y_error**2 + error_scale*y_prediction_error**2/y_error**2
 
+                loss = loss.mean(axis=0)
+
             else: 
-                loss = loss_func(params,Y_actual,Y_error)
+                loss = loss_func(X,D,Y_actual,Y_error)
 
             f = -1 * loss
             
             return f 
 
         class LogLike(Op):
-            def make_node(self, params, data) -> Apply:
+            def make_node(self, X, D, Y_data) -> Apply:
                 # Convert inputs to tensor variables
-                params = pt.as_tensor(params)
-                data = pt.as_tensor(data)
+                X = pt.as_tensor(X)
+                D = pt.as_tensor(D)
+                Y_data = pt.as_tensor(Y_data)
 
-                inputs = [params, data]
+                inputs = [X, D, Y_data]
                 # Define output type, in our case a vector of likelihoods
                 outputs = [pt.vector()]
 
@@ -218,10 +270,10 @@ class Surrogate:
             def perform(self, node: Apply, inputs: list[np.ndarray], outputs: list[list[None]]) -> None:
                 # This is the method that compute numerical output
                 # given numerical inputs. Everything here is numpy arrays
-                params, data = inputs  # this will contain my variables
+                X, D, Y_data = inputs  # this will contain my variables
 
                 # call our numpy log-likelihood function
-                loglike_eval = my_loglike(params, data)
+                loglike_eval = my_loglike(X,D, Y_data)
 
                 # Save the result in the outputs list provided by PyTensor
                 # pre-populated with a `None` where the result should be saved.
@@ -230,41 +282,41 @@ class Surrogate:
 
         loglike_op = LogLike()
 
-        def custom_dist_loglike(data, params):
+        def custom_dist_loglike(Y_data, X, D):
 
             # create our Op
-            return loglike_op(params, data)
+            return loglike_op(X, D, Y_data)
 
         # use PyMC to sampler from log-likelihood
         with pm.Model() as no_grad_model:
 
-            params = []
+            X = []
 
             if import_prior is not None:
-                for i in range(self.D):
+                for i in range(self.M):
  
                     samples = import_prior[:,i]
 
-                    smin,smax = self.parameter_range[i]
+                    smin,smax = self.X_range[i]
 
                     x = np.linspace(smin, smax, 100)
                     y = scipy.stats.gaussian_kde(samples)(x)
 
-                    params.append(pm.Interpolated(self.parameter_names[i], x, y))
+                    X.append(pm.Interpolated(self.X_labels[i], x, y))
             else:
 
-                for i in range(self.D):
+                for i in range(self.M):
                     
-                    distribution = pm.Uniform(self.parameter_names[i], 
-                                            lower=self.parameter_range[i][0], 
-                                            upper=self.parameter_range[i][1],
+                    distribution = pm.Uniform(self.X_labels[i], 
+                                            lower=self.X_range[i][0], 
+                                            upper=self.X_range[i][1],
                                             initval=initval[i] if initval is not None else None)
                     
-                    params.append(distribution)
+                    X.append(distribution)
 
             # use a CustomDist with a custom logp function
             likelihood = pm.CustomDist(
-                "likelihood", params, observed=data, logp=custom_dist_loglike,
+                "likelihood", X, D, observed=Y_data, logp=custom_dist_loglike,
             )
 
         ip = no_grad_model.initial_point()
@@ -279,3 +331,4 @@ class Surrogate:
             idata_no_grad = pm.sample(step=step,**kwargs) #50_000, tune=50_000,cores=4,chains=4,step=step,return_inferencedata=True)
         
         return idata_no_grad
+    
